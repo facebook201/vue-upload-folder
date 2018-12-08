@@ -7,7 +7,7 @@
       v-if="useCustomSlot"
       class="dz-message"
       ref="renderMessage">
-      <slot>Drop files here to upload</slot>
+      <slot>拖拽上传文件夹</slot>
     </div>
   </div>
 </template>
@@ -18,15 +18,17 @@ import Dropzone from 'dropzone';
 Dropzone.autoDiscover = false;
 
 export default {
-  name: 'vue-upload-folder',
+  name: 'upload-folder-space',
 
   props: {
+    // 组件定义的id值 默认 dropzone
     id: {
       type: String,
       required: true,
       default: 'dropzone'
     },
     action: String,
+    requestProject: String, 
     parentId: String,
     options: {
       type: Object,
@@ -47,16 +49,11 @@ export default {
     useCustomSlot: {
       type: Boolean,
       default: false
-    },
-    awss3: {
-      type: Object,
-      default: null
     }
   },
 
   data() {
     return {
-      wasQueueAutoProcess: true,
       idList: []
     };
   },
@@ -68,8 +65,8 @@ export default {
         thumbnailWidth: 200,
         thumbnailHeight: 200
       };
-      // 这里我手动限制30张
-      this.options.parallelUploads = 30;
+      // 限制上限 1000
+      this.options.parallelUploads = 1000;
       Object.keys(this.options).forEach(function(key) {
         defaultValues[key] = this.options[key]
       }, this);
@@ -79,14 +76,11 @@ export default {
 
   created() {
     this.folder = [];
-    this.folderId = [];
-    this.folderName = [];
-    this.picName = [];
     // 如是上传单张图片
-    this.singlePic = false;
-    this.parentIdList = [];
     this.uploadFolder = [];
     this.uploadFlag = false;
+    this.requestUrl = window.location.origin;
+    // this.requestUrl = this.requestUrl; 这里自己修改自己对应的接口地址
   },
 
   mounted() {
@@ -97,44 +91,39 @@ export default {
     this.dropzone = new Dropzone(this.$refs.dropzoneElement, this.dropzoneSettings);
     let vm = this;
 
-    // 生成缩略图 接收url
-    this.dropzone.on('thumbnail', function(file, dataUrl) {
-      vm.$emit('vdropzone-thumbnail', file, dataUrl);
-    });
-
     // 将文件添加到上传列表
     this.dropzone.on('addedfile', file => {
       // 如果有fullPath 表示有文件夹
       if (file.fullPath) {
         const path = file.fullPath.split('/');
-        this.folder = this.singleFolder(path, 0, this.folder, this.parentId);
-        this.deepUpload(this.folder, this.parentId);
+        this.folder = this.singleFolder(path, 0, this.folder);
       }
-
       // 限制上传的格式
       let filetype = file.type.split('/')[1];
       if (!this.filetypes.includes(filetype)) {
         this.$message.warning(`您上传的是${filetype}格式，只接收png、jpg、gif的格式`);
-        this.removeAllFiles(true);
+        this.removeFile(file);
         return;
       }
       
       // 限制大小
       if (Math.floor(file.size / this.limitSize) >= 5) {
         this.$message.warning(`上传的图片超过5M最大限制，请先压缩再上传！`);
-        this.removeAllFiles(true);
+        this.removeFile(file);
         return;
       }
-    
-      
-      setTimeout(() => {
-        if (this.getQueuedFiles().length > 30) {
-          this.$message.warning(`上传图片总数量不能30张上限！`);
-          this.removeAllFiles(true);
-        } else {
+
+      if (!this.uploadFlag) {
+        // 先把树形结构组装起来
+        this.uploadFlag = true;
+        setTimeout(() => {
+          this.deepUpload(this.folder, this.parentId);
+        }, 100);
+        setTimeout(_ => {
+          console.log(this.folder);
           this.dropzone.processQueue();
-        }
-      }, 500);
+        }, 1500);
+      }
 
       if (this.$refs.renderMessage.style.display === 'block') {
         this.$refs.renderMessage.style.display = 'none';
@@ -157,93 +146,59 @@ export default {
       }
       
       vm.$emit('vdropzone-file-added', file);
-
-      if (vm.isS3 && vm.wasQueueAutoProcess) {
-        vm.getSignedAndUploadToS3(file);
-      }
     });
 
     this.dropzone.on('sending', (file, xhr, formData) => {
-      const i = file.fullPath && file.fullPath.split('/').length - 2;
-      if (this.singlePic) {
-        formData.append('parentId', this.parentId);
+      // 找id根据名字
+      if (file.fullPath) {
+        const pathArr = file.fullPath.split('/');
+        const LEN = pathArr.length - 2;
+        const id = this.findId(this.folder, pathArr, 0, LEN);
+        formData.append('parentId', id);
       } else {
-        formData.append('parentId', this.idList[i]);
+        formData.append('parentId', this.parentId);
       }
     });
 
     // 将多文件添加到上传列表
     this.dropzone.on('addedfiles', files => {
-      // 这里写入第一层的文件夹结构
-      if (files.length === 1) {
-        if (files[0].name.includes('.')) {
-          this.singlePic = true;
-        } else {
-          // 单个文件夹 我们现在加上
-          this.singlePic = false;
-        }
-      } else {
-        // 多个文件
-      }
-      this.$emit('vdropzone-files-added', files);
+      // 如果是拖动上传文件夹和图片 或者多个图片 
+      this.$emit('files-added', files);
     });
 
     // 移除上传文件
     this.dropzone.on('removedfile', function(file) {
-      vm.$emit('vdropzone-removed-file', file);
+      vm.$emit('removed-file', file);
       if (file.manuallyAddFile) vm.dropzone.options.maxFiles++;
     });
 
     this.dropzone.on('success', (file, response) => {
-      vm.$emit('vdropzone-removed-file', file);
-      if (file.manuallyAddFile) vm.dropzone.options.maxFiles++;
-    });
-
-    this.dropzone.on('success', (file, response) => {
-      // 上传成功之后 删除之前的点
       this.$message.success('上传成功');
       setTimeout(() => {
-        // 移除上传成功的图片
         file.previewElement.parentNode.removeChild(file.previewElement);
         if (!document.querySelector('.dz-preview') && this.$refs.renderMessage.style.display !== 'block') {
           this.$refs.renderMessage.style.display = 'block';
         }
-      }, 1000);
+      }, 100);
 
-      vm.$emit('vdropzone-success', file, response);
-      if (vm.isS3) {
-        if (vm.isS3OverridesServerPropagetion) {
-          var xmlResponse = (new window.parseDOM()).parseFormString(response, 'text/xml');
-          var s3ObjectLocation = xmlResponse.firstChild.children[0].innerHTML;
-          vm.$emit('vdropzone-s3-upload-success', s3ObjectLocation);
-        }
-        if (vm.wasQueueAutoProcess) {
-          vm.setOption('autoProcessQueue', false);
-        }
-      }
+      vm.$emit('upload-success', file, response);
     });
 
-    this.dropzone.on('successmultiple', function(file, response) {
-      vm.$emit('vdropzone-success-multiple', file, response);
-    });
+   
 
-    // 上传失败的操作
     this.dropzone.on('error', (file, message, xhr) => {
       this.$message.error('上传失败');
       setTimeout(() => {
-        // 移除上传成功的图片
         file.previewElement.parentNode.removeChild(file.previewElement);
         if (!document.querySelector('.dz-preview') && this.$refs.renderMessage.style.display !== 'block') {
           this.$refs.renderMessage.style.display = 'block';
         }
-      }, 1000);
-      this.$emit('vdropzone-error', file, message, xhr);
-      if (this.isS3) {
-        vm.$emit('vdropzone-s3-upload-error');
-      }
+      }, 100);
     });
-   
+
+    
     this.dropzone.on('complete', file => {
+      this.uploadFlag = false;
       this.folder.length = 0;
       setTimeout(() => {
         // 移除上传成功的图片
@@ -251,48 +206,30 @@ export default {
         if (!document.querySelector('.dz-preview') && this.$refs.renderMessage.style.display !== 'block') {
           this.$refs.renderMessage.style.display = 'block';
         }
-      }, 1000);
-      vm.$emit('vdropzone-complete', file);
-    });
-   
-    this.dropzone.on('canceled', function(file) {
-      vm.$emit('vdropzone-canceled', file)
+        vm.$emit('upload-complete');
+      }, 100);
+      
     });
 
+   
     this.dropzone.on('processing', function(file) {
-      vm.$emit('vdropzone-processing', file)
+      vm.$emit('upload-processing', file)
     });
 
     this.dropzone.on('uploadprogress', function(file, progress, bytesSent) {
-      vm.$emit('vdropzone-upload-progress', file, progress, bytesSent)
+      vm.$emit('upload-progress', file, progress, bytesSent)
+    });
+
+    this.dropzone.on('queuecomplete', function(file) {
+      vm.$emit('queue-complete')
     });
 
     // 拖动到框之后
     this.dropzone.on('drop', function(event) {
-      vm.$emit('vdropzone-drop', event)
+      vm.$emit('upload-drop', event)
     });
 
-    this.dropzone.on('dragstart', function(event) {
-      vm.$emit('vdropzone-drag-start', event)
-    });
-
-    this.dropzone.on('dragend', function(event) {
-      vm.$emit('vdropzone-drag-end', event)
-    });
-
-    this.dropzone.on('dragenter', function(event) {
-      vm.$emit('vdropzone-drag-enter', event)
-    });
-
-    this.dropzone.on('dragover', function(event) {
-      vm.$emit('vdropzone-drag-over', event)
-    });
-
-    this.dropzone.on('dragleave', function(event) {
-      vm.$emit('vdropzone-drag-leave', event)
-    });
-
-    vm.$emit('vdropzone-mounted');
+    vm.$emit('upload-mounted');
   },
 
   beforeDestroy() {
@@ -300,43 +237,12 @@ export default {
   },
 
   methods: {
-    manuallyAddFile: function(file, fileUrl) {
-      file.manuallyAdded = true;
-      this.dropzone.emit("addedfile", file);
-      let containsImageFileType = false;
-
-      if (fileUrl.indexOf('.png') > -1 || 
-          fileUrl.indexOf('.jpg') > -1 ||
-          fileUrl.indexOf('.jpeg') > -1) { 
-        containsImageFileType = true;
-      }
-      if (this.dropzone.options.createImageThumbnails &&
-          containsImageFileType &&
-          file.size <= this.dropzone.options.maxThumbnailFilesize * 1024 * 1024) {
-        fileUrl && this.dropzone.emit("thumbnail", file, fileUrl);
-        var thumbnails = file.previewElement.querySelectorAll('[data-dz-thumbnail]');
-        for (var i = 0; i < thumbnails.length; i++) {
-          thumbnails[i].style.width = this.dropzoneSettings.thumbnailWidth + 'px';
-          thumbnails[i].style.height = this.dropzoneSettings.thumbnailHeight + 'px';
-          thumbnails[i].style['object-fit'] = 'contain';
-        }
-      }
-      this.dropzone.emit("complete", file);
-      if (this.dropzone.options.maxFiles) this.dropzone.options.maxFiles--;
-      this.dropzone.files.push(file);
-      this.$emit('vdropzone-file-added-manually', file);
-    },
-
-
-    // 设置参数
     setOption: function(option, value) {
       this.dropzone.options[option] = value
     },
-
     removeAllFiles: function(bool) {
       this.dropzone.removeAllFiles(bool)
     },
-
     processQueue: function() {
       let dropzoneEle = this.dropzone;
       if (this.isS3 && !this.wasQueueAutoProcess) {
@@ -358,45 +264,19 @@ export default {
     init: function() {
       return this.dropzone.init();
     },
-
     // 销毁实例
     destroy: function() {
       return this.dropzone.destroy();
     },
-
-   
-    disable: function() {
-      return this.dropzone.disable();
-    },
-    
-    filesize: function(size) {
-      return this.dropzone.filesize(size);
-    },
-    
     accept: function(file, done) {
       return this.dropzone.accept(file, done);
     },
-    
     addFile: function(file) {
       return this.dropzone.addFile(file);
     },
-    
     removeFile: function(file) {
       this.dropzone.removeFile(file)
     },
-    
-    getAcceptedFiles: function() {
-      return this.dropzone.getAcceptedFiles()
-    },
-    
-    getRejectedFiles: function() {
-      return this.dropzone.getRejectedFiles()
-    },
-    
-    getFilesWithStatus: function() {
-      return this.dropzone.getFilesWithStatus()
-    },
-    
     getQueuedFiles: function() {
       return this.dropzone.getQueuedFiles()
     },
@@ -406,130 +286,96 @@ export default {
     getAddedFiles: function() {
       return this.dropzone.getAddedFiles()
     },
-    getActiveFiles: function() {
-      return this.dropzone.getActiveFiles()
-    },
-
-    // 一层的情况
-    singleFolder(newPath, level, folder, parentId) {
-      if (!newPath[level].includes('.') ) {
-        if (folder.length) {
-          folder.forEach(item => {
-            if (item.name != newPath[level]) {
-              const node = {
-                parentId: parentId,
-                children: [],
-                isDir: true,
-                name: newPath[level],
-                level
-              };
-
-              folder.push(node);
+    /**
+     * @param { newPath 文件路径拆开的数组 }
+     * @param { level 层级 表示是第几层 }
+     * @param { folder 传进来的文件夹树形结构 首次为空数组 }
+     */
+    singleFolder(newPath, level, folder) {
+      let sum = 0;
+      const ret = JSON.parse(JSON.stringify(folder));
+      // newPath[level] 不能跟folder名字相同
+      if (!newPath[level].includes('.')) {
+        // 如果不是空文件夹 
+        if (ret.length) {
+          // 如果里面有就添加到当前下面 没有就添加到这一层
+          for (let i = 0; i < ret.length; i++) {
+            if (newPath[level] == folder[i].name) {
               if (newPath[level + 1]) {
-                const children = this.singleFolder(newPath, level + 1, node.children);
-                node.children = children;
+                ret[i].children = this.singleFolder(newPath, level + 1, ret[i].children);
+                return ret;
               }
-            } else if(newPath[level + 1]) {
-              const children = this.singleFolder(newPath, level + 1, item.children);
-              item.children = children;
+            } else {
+              sum++;
             }
-          })
+          }
+          // 如果能走到这里就表示不相等
+          if (sum == ret.length) {
+            const node = {
+              children: [],
+              isDir: true,
+              name: newPath[level],
+              level
+            };
+            ret.push(node);
+            if (newPath[level + 1]) {
+              node.children = this.singleFolder(newPath, level + 1, node.children);
+            }
+          }
         } else {
           const node = {
-            parentId: parentId,
             children: [],
             isDir: true,
             name: newPath[level],
             level
           };
-          if (name.name != newPath[level]) {
-            folder.push(node);
-            if (newPath[level + 1]) {
-              const children = this.singleFolder(newPath, level + 1, node.children);
-              node.children = children;
-            }
+          ret.push(node);
+          // 看后面还有没有元素
+          if (newPath[level + 1]) {
+            node.children = this.singleFolder(newPath, level + 1, node.children);
           }
         }
       } else {
-        if (folder.length) {
-          folder.forEach(item => {
-            if (item.name != newPath[level]) {
-              const node = {
-                isDir: false,
-                name: newPath[level],
-                level
-              };
-              folder.push(node);
-            }
-          })
-        } else {
           const node = {
             isDir: false,
             name: newPath[level],
             level
           };
-          folder.push(node);
-        }
+          ret.push(node);
       }
-      return folder;
+      return ret;
     },
 
-
-    // 遍历第一层 递归后面的路径参数
-    addChildren(folder, path) {
-      folder.forEach(item => {
-        if (path[0] == item.name) {
-          const node = {
-            ...item,
-            level: 0
-          };
-          folder.push(node);
-          if (node.children) {
-            const children = this.addDeepFolder(path, node.level);
-            node.children = children;
+    /** 查找id
+     * @param list 树形结构
+     * @param arr 文件的路径
+     * @param 文件的层级
+     * @param 路径的length
+     * return 返回的是 这个图片是哪个文件夹下对应的id
+     */
+    findId(list, arr, level, len) {
+      let id;
+      let i = 0;
+      while(i < list.length) {
+        if (list[i].name == arr[level]) {
+          if (level == len) {
+            id = list[i].parentId;
+            return id;
+          }
+          if (arr[level + 1] && !arr[level + 1].includes('.')) {
+            id = this.findId(list[i].children, arr, level + 1, len);
           }
         }
-      });
-      return folder;
-    },
-
-    // 递归添加文件夹和图片
-    addDeepFolder(path, level) {
-      const nodes = [];
-      if (path[level + 1]) {
-        if (!path[level + 1].includes('.')) {
-          const node = {
-            level: level + 1,
-            name: path[level + 1],
-            parentId: null,
-            children: [],
-            isDir: true
-          };
-          nodes.push(node);
-          if (node.children) {
-            const children = this.addDeepFolder(path, level + 1);
-            node.children = children;
-          }
-        } else {
-            const node = {
-              level: level + 1,
-              name: path[level + 1],
-              parentId: null,
-              children: null,
-              isDir: false
-            };
-            nodes.push(node);
-        }
+        i++;
       }
-      return nodes;
+      return id;
     },
-
+    //上传文件夹
     deepUpload(folder, returnParentId) {
       // 如果存在文件夹
       folder.forEach(item => {
-        if (!item.name.includes('.')) {
-          if (!this.uploadFolder.includes(item.name)) {
-            this.uploadFolder.push(item.name);
+        if (item.isDir) {
+          this.uploadFolder[item.level] = this.uploadFolder[item.level] || [];
             const id = item.parentId ? item.parentId : returnParentId;
             // 不存在就开始上传
             this.axios.get(`
@@ -537,22 +383,22 @@ export default {
               `).then(res => {
                 if (res.data) {
                   if (res.data.errorCode === 0) {
+                  // 成功之后返回的 parentId 添加到 
                     const returnParentId = res.data.result.id;
-                    this.idList.push(returnParentId);
+                    item.parentId = returnParentId;
                     if (item.children && item.children.length) {
                       setTimeout(() => {
                         this.deepUpload(item.children, returnParentId);
-                      }, 10);
+                      }, 0);
                     }
                   } else if (res.data.errorCode === 1) {
-                    this.$message.error('已存在改文件夹！');
+                    this.$message.error('已存在该文件夹！');
                     this.removeAllFiles(true);
                     return;
                   }
                 }
               });
           }
-        }
       });
     }
   }
